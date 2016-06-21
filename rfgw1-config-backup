@@ -1,0 +1,267 @@
+#!/usr/bin/perl
+#
+# Change History:
+# 3/3/2016: v0.1 - Initial version
+# 3/3/2016: v0.2 - Added some close()s for SNMP session
+#
+# rfgw1-config-backup v0.2 - Dan Kok, Cisco, 3/3/2016
+# Copyright 2016, Cisco Systems, Inc.  All Rights Reserved.
+#
+# This program is provided free of charge and as such is provided without warranty of any
+# kind.  In no event shall Dan Kok, Cisco Systems or their subsidiaries, suppliers,
+# resellers, heirs or assigns be held liable for any damages resulting from the use or
+# inability to use the program.
+#
+# This program and any concepts, techniques, information or Application Programming
+# Interfaces contained within is Confidential and subject to the mutual NDA between
+# your company and Cisco.
+#
+# This program is minimally tested and provided for no other purpose than a proof
+# of concept.  As-is, it is not suitable for use in production networks.  It is
+# unsupported and undocumented.
+#
+# This program is a proof of concept for using SNMP to cause a Cisco RFGW-1 QAM to send
+# its running configuration to an FTP server for the purposes of configuration backup.
+# Note that the RFGW-1 Configuration Guide says that, with regard to Configuration
+# Backup "The RF Gateway 1 performs configuration backup via FTP to a backup server. The
+# backup databases generally contain QAM parameters, channel application modes
+# and mapping tables.  The backup databases generally do not include IP networking
+# settings (including management as well as GbE input port parameters)."  This makes
+# sense in that you will have had to configure at least some of those things to be able
+# to restore a configuration.
+#
+# Arguments are:
+# --debug : Produce voluminous messages as to what's going on.  If you're working on the
+#	code either specify --debug when you run it or bound the code you're working on with
+#	$debug = 1; and $debug = 0; to turn it on and off for that section
+# --rfgw1 : The RFGW-1 IP address
+# -c or --community : The SNMP Read/Write community string on the RFGW-1.  Note the RFGW-1
+# doesn't seem to support the concept of a read AND write community string.  Since
+# Net::SNMP only supports one community string, for this program to work the RFGW-1's
+# read and write community strings must be set to the same value.  That could be worked
+# around in this code with multiple session objects in a future release.
+# --ftp or --ftpip or --ftpipaddress : The FTP server the configuration should be written to
+# -u or --user or --username : username for the FTP server the configuration should be written to
+# -p or --pass or --password : password for the FTP server the configuration should be written to
+# --path or --filepath : The file path on the FTP server that the configuration should be written to
+# --name or --filename : The file name on the FTP server that the configuration should be written to
+# --timeout : The amount of time this program should wait for the RFGW-1 to say the backup has
+# finished.  The default is 30 seconds.
+#
+# Command line used in testing on perl v5.18.2 and RFGW-1 release 06.01.07:
+# ./rfgw1-config-backup --rfgw1 10.86.3.135 -c private --ftpip 10.86.3.131 --username rfgw1 --password MarryHadALittleLamb --path . --name test.gz --debug
+#
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Data::Dumper;
+use Net::SNMP qw(:ALL);
+use Socket;
+
+# Some of these OIDs and values from CISCO-RFGW-1-MIB.my
+my $sysDescr = '.1.3.6.1.2.1.1.1.0';
+my $sysName = '.1.3.6.1.2.1.1.5.0';
+my $rfgw1FileMgmtCmd = '.1.3.6.1.4.1.1429.1.12.1.2.20.1.0';
+my $rfgw1FileMgmtState = '.1.3.6.1.4.1.1429.1.12.1.2.20.10.0';
+my $rfgw1FileMgmtResult = '.1.3.6.1.4.1.1429.1.12.1.2.20.11.0';
+my $rfgw1FileMgmtConfigIpAdrsType = '.1.3.6.1.4.1.1429.1.12.1.2.20.12.0';
+my $rfgw1FileMgmtConfigIpAddress = '.1.3.6.1.4.1.1429.1.12.1.2.20.13.0';
+my $rfgw1FileMgmtConfigUsername = '.1.3.6.1.4.1.1429.1.12.1.2.20.14.0';
+my $rfgw1FileMgmtConfigPassword = '.1.3.6.1.4.1.1429.1.12.1.2.20.15.0';
+my $rfgw1FileMgmtConfigFilePath = '.1.3.6.1.4.1.1429.1.12.1.2.20.16.0';
+my $rfgw1FileMgmtConfigFileName = '.1.3.6.1.4.1.1429.1.12.1.2.20.17.0';
+
+my $rfgw1FileMgmtCmdBackup = 8;					# Backup Command
+my $rfgw1FileMgmtStateIdle = 1;					# Idle State
+my $rfgw1FileMgmtResultFtpSuccess = 100;		# FTP Success (This is the result from a successful backup)
+my $rfgw1FileMgmtResultBackupSuccess = 800;		# Backup Success (This is not the result from a successful backup)
+my $rfgw1FileMgmtResultNoResultAvailable = 999;	# Result isn't available yet
+
+my $ftpipaddresstype = 1;
+
+my $debug = 0;
+my $rfgw1 = '';
+my $community = '';
+my $ftpipaddress = '';
+my $username = '';
+my $password = '';
+my $filepath = '';
+my $filename = '';
+my $timeout = 30;
+
+my $session = {};
+my $error = '';
+my $response = {};
+my $time = 0;
+
+# Get command line arguments
+GetOptions("debug" => \$debug,
+	"rfgw1=s" => \$rfgw1,
+	"c|community=s" => \$community,
+	"ftp|ftpip|ftpipaddress=s" => \$ftpipaddress,
+	"u|user|username=s" => \$username,
+	"p|pass|password=s" => \$password,
+	"path|filepath=s" => \$filepath,
+	"name|filename=s" => \$filename,
+	"t|timeout" => \$timeout
+	) or USAGE(__LINE__, "Incorrect usage\n");
+
+# Ensure all of the command line arguments we require have been specified
+DEBUG(__LINE__, "Ensure all of the command line arguments we need have been specified\n");
+if (!$rfgw1) { USAGE(__LINE__, "--rfgw1 not specified\n");	}
+if (!$community) { USAGE(__LINE__, "-c or --community not specified\n");	}
+if (!$ftpipaddress) { USAGE(__LINE__, "--ftpip not specified\n");	}
+if (!$username) { USAGE(__LINE__, "-u or --user or --username not specified\n");	}
+if (!$password) { USAGE(__LINE__, "-p or --pass or --password not specified\n");	}
+if (!$filepath) { USAGE(__LINE__, "--path or --filepath not specified\n");	}
+if (!$filename) { USAGE(__LINE__, "--name or --filename not specified\n");	}
+
+# Create the SNMP session object
+DEBUG(__LINE__, "Create session object\n");
+($session, $error) = Net::SNMP->session(
+	-hostname  => $rfgw1,
+	-version   => 'snmpv2c',
+	-community => $community,
+	);
+if (!defined($session)) {
+	DIE(__LINE__, "session error: " . $error . "\n");
+}
+
+# Get and display sysDescr and sysName
+MESSAGE(__LINE__, "RFGW-1 Configuration Backup initiated for an RFGW-1 that describes itself as:\n");
+DEBUG(__LINE__, "Get and display sysName and sysDescr\n");
+$response = SNMPget($session, $sysName);
+MESSAGE(__LINE__, "sysName=" . $response->{$sysName} . "\n");
+$response = SNMPget($session, $sysDescr);
+MESSAGE(__LINE__, "sysDescr=" . $response->{$sysDescr} . "\n");
+
+# Set up MIB objects for configuration backup based on command line arguments.
+# The SNMPset subroutine and this code sets these one at a time because the RFGW-1
+# seems to only allow setting one SNMP object at a time or certain combinations of
+# two (rfgw1FileMgmtConfigIpAdrsType and rfgw1FileMgmtConfigIpAddress can be set
+# together).  Setting them one at a time always works.
+DEBUG(__LINE__, "Set up FileMgmt OIDs for configuration backup based on command line arguments\n");
+SNMPset($session, $rfgw1FileMgmtConfigIpAdrsType, INTEGER, $ftpipaddresstype);
+SNMPset($session, $rfgw1FileMgmtConfigIpAddress, OCTET_STRING, $ftpipaddress);
+SNMPset($session, $rfgw1FileMgmtConfigUsername, OCTET_STRING, $username);
+SNMPset($session, $rfgw1FileMgmtConfigPassword, OCTET_STRING, $password);
+SNMPset($session, $rfgw1FileMgmtConfigFilePath, OCTET_STRING, $filepath);
+SNMPset($session, $rfgw1FileMgmtConfigFileName, OCTET_STRING, $filename);
+
+# Initiate configuration backup
+DEBUG(__LINE__, "Initiating configuration backup\n");
+SNMPset($session, $rfgw1FileMgmtCmd, INTEGER, $rfgw1FileMgmtCmdBackup);
+
+# Wait until configuration backup is done
+DEBUG(__LINE__, "Wait for completion\n");
+for ($time = 0; $time < $timeout; $time++) {
+	$response = SNMPget($session, $rfgw1FileMgmtState);
+	DEBUG(__LINE__, "\$response->{\$rfgw1FileMgmtState}=" . $response->{$rfgw1FileMgmtState} . "\n");
+	if ($response->{$rfgw1FileMgmtState} == $rfgw1FileMgmtStateIdle) {
+		DEBUG(__LINE__, "Idle state\n");
+		last;
+	}
+	DEBUG(__LINE__, "Waiting..." . $time . "\n");
+	sleep(1);
+}
+
+# Did we time out?
+DEBUG(__LINE__, "Check timeout\n");
+if ($time == $timeout) {
+	$session->close();
+	DIE(__LINE__, "Timeout waiting for RFGW-1 command idle state\n");
+}
+
+# Wait until the command result is available
+DEBUG(__LINE__, "Check result\n");
+for ($time = 0; $time < $timeout; $time++) {
+	$response = SNMPget($session, $rfgw1FileMgmtResult);
+	DEBUG(__LINE__, "\$response->{\$rfgw1FileMgmtResult}=" . $response->{$rfgw1FileMgmtResult} . "\n");
+	if ($response->{$rfgw1FileMgmtResult} != $rfgw1FileMgmtResultNoResultAvailable) {
+		DEBUG(__LINE__, "Result available\n");
+		last;
+	}
+	DEBUG(__LINE__, "Waiting..." . $time . "\n");
+	sleep(1);
+}
+
+# Did we time out?
+DEBUG(__LINE__, "Check timeout\n");
+if ($time == $timeout) {
+	$session->close();
+	DIE(__LINE__, "Timeout waiting for RFGW-1 command result\n");
+}
+
+# Check the command result
+if (($response->{$rfgw1FileMgmtResult} == $rfgw1FileMgmtResultFtpSuccess)
+|| ($response->{$rfgw1FileMgmtResult} == $rfgw1FileMgmtResultBackupSuccess)) {
+	$session->close();
+	MESSAGE(__LINE__, "RFGW-1 Configuration backup successful\n");
+	exit 0;
+} else {
+	$session->close();
+	DIE(__LINE__, "RFGW-1 Configuration backup failed: " . $response->{$rfgw1FileMgmtResult} . "\n");
+}
+
+sub SNMPget {
+	my $session = shift;
+	my $oid = shift;
+	my $response = {};
+
+	DEBUG(__LINE__, "SNMPget oid=" . $oid . "\n");
+
+	$response = $session->get_request(
+		-varbindlist => [
+			$oid
+		]);
+	if (!defined($response)) {
+		DIE(__LINE__, "SNMPget get_request error: " . $session->error() . "\n");
+	}
+	DEBUG(__LINE__, "Dumper(\$response)=" . Dumper($response));
+	return $response;
+}
+
+sub SNMPset {
+	my $session = shift;
+	my $oid = shift;
+	my $type = shift;
+	my $value = shift;
+	my $response = {};
+
+	DEBUG(__LINE__, "SNMPset oid=" . $oid . ", type=" . $type . ", value=" . $value . "\n");
+
+	$response = $session->set_request(
+		-varbindlist  => [
+			$oid, $type, $value
+			]
+		);
+	if (!defined($response)) {
+		DIE(__LINE__, "SNMPset set_request error: " . $session->error() . "\n");
+	}
+	DEBUG(__LINE__, "Dumper(\$response)=" . Dumper($response));
+	if ($response->{$oid} ne $value) {
+		DIE(__LINE__, "SNMPset set_request error: \$response{\$oid} ne \$value\n");
+	}
+	return $response;
+}
+
+sub MESSAGE	{
+	my $line = shift;
+	print __FILE__ . ":[" . $line . "]: " . shift;
+}
+
+sub DEBUG {
+	my $line = shift;
+	if ($debug) { print __FILE__ . ":[" . $line . "]: DEBUG: " . shift; }
+}
+
+sub DIE	{
+	my $line = shift;
+	die __FILE__ . ":[" . $line . "]: FATAL: " . shift;
+}
+
+sub USAGE {
+	my $line = shift;
+	DIE(__LINE__, shift . "Usage: " . __FILE__ . " --rfgw1 RFGW-1 IP Address --ftpip FTP Server IP Address --username FTP Server User Name --password FTP Server Password --filepath FTP Server File Path --filename FTP Server File Name [--debug]\n");
+}
